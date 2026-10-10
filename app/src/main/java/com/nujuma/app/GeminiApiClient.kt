@@ -73,21 +73,21 @@ object GeminiApiClient {
             val jsonBody = JSONObject()
             val contents = JSONArray()
 
-            val systemInstruction = "Aturan: Jika memberikan kode program, sertakan nama file di baris pertama di dalam blok kode dengan format komentar, contoh: // filename: main.kt atau -- filename: main.lua atau # filename: app.py"
-
-            var isFirst = true
             for (msg in history) {
                 val roleStr = if (msg.isUser) "user" else "model"
-                var textContent = msg.message
-                if (isFirst && msg.isUser) {
-                    textContent = "$systemInstruction\n\n$textContent"
-                    isFirst = false
-                }
-                val parts = JSONArray().put(JSONObject().put("text", textContent))
+                val codeTexts = msg.codeFiles.joinToString("\n") { "```${it.language}\n// filename: ${it.fileName}\n${it.content}\n```" }
+                val fullText = msg.message + if (codeTexts.isNotEmpty()) "\n$codeTexts" else ""
+
+                val parts = JSONArray().put(JSONObject().put("text", fullText))
                 contents.put(JSONObject().put("role", roleStr).put("parts", parts))
             }
 
             jsonBody.put("contents", contents)
+
+            // Mengaktifkan fitur Search Grounding agar informasi selalu up-to-date
+            val toolsArray = JSONArray().put(JSONObject().put("googleSearch", JSONObject()))
+            jsonBody.put("tools", toolsArray)
+
             val writer = OutputStreamWriter(conn.outputStream)
             writer.write(jsonBody.toString())
             writer.flush()
@@ -109,7 +109,9 @@ object GeminiApiClient {
                     .getJSONObject(0)
                     .getString("text")
             } else {
-                "Error: Kode Respon ${conn.responseCode}"
+                val errorStream = conn.errorStream
+                val errorMsg = if (errorStream != null) BufferedReader(InputStreamReader(errorStream)).readText() else ""
+                "Error: Kode Respon ${conn.responseCode} - $errorMsg"
             }
         } catch (e: Exception) {
             "Error: ${e.localizedMessage}"

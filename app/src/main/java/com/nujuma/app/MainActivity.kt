@@ -335,8 +335,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         showThinkingIndicator()
 
+        // Saring pesan placeholder "berpikir" agar tidak dikirim ke API (mencegah Error 400)
+        val historyToSend = messages.filter { it.message != "Nujuma sedang berpikir..." }
+
         thread {
-            val rawResponse = GeminiApiClient.sendMessage(apiKey, selectedModel, messages)
+            val rawResponse = GeminiApiClient.sendMessage(apiKey, selectedModel, historyToSend)
 
             val codeBlockRegex = Regex("```(\\w+)?\\n([\\s\\S]*?)```")
             val matches = codeBlockRegex.findAll(rawResponse)

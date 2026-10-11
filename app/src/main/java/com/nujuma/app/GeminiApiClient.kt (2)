@@ -78,7 +78,17 @@ object GeminiApiClient {
                 val codeTexts = msg.codeFiles.joinToString("\n") { "```${it.language}\n// filename: ${it.fileName}\n${it.content}\n```" }
                 val fullText = msg.message + if (codeTexts.isNotEmpty()) "\n$codeTexts" else ""
 
-                val parts = JSONArray().put(JSONObject().put("text", fullText))
+                val parts = JSONArray()
+                
+                // Menambahkan data multimodal (gambar/audio) jika tersedia
+                if (!msg.attachmentBase64.isNullOrEmpty() && !msg.attachmentMimeType.isNullOrEmpty()) {
+                    val inlineData = JSONObject()
+                        .put("mime_type", msg.attachmentMimeType)
+                        .put("data", msg.attachmentBase64)
+                    parts.put(JSONObject().put("inline_data", inlineData))
+                }
+
+                parts.put(JSONObject().put("text", fullText))
                 contents.put(JSONObject().put("role", roleStr).put("parts", parts))
             }
 

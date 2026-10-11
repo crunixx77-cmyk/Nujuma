@@ -2,10 +2,8 @@ package com.nujuma.app
 
 import android.Manifest
 import android.app.AlertDialog
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
@@ -15,10 +13,8 @@ import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Base64
-import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
-import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.LinearLayout
@@ -33,253 +29,8 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.io.OutputStreamWriter
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.URLEncoder
 import java.util.Locale
 import kotlin.concurrent.thread
-
-data class CodeFile(
-    val fileName: String,
-    val content: String,
-    val language: String
-)
-
-data class ChatMessage(
-    val message: String,
-    val isUser: Boolean,
-    val codeFiles: List<CodeFile> = emptyList(),
-    val attachmentBase64: String? = null,
-    val attachmentMimeType: String? = null
-)
-
-data class Account(val name: String, val apiKey: String)
-
-class AccountManager(private val context: Context) {
-    private val prefs = context.getSharedPreferences("nujuma_accounts", Context.MODE_PRIVATE)
-
-    fun getAllAccounts(): List<Account> {
-        val jsonStr = prefs.getString("accounts_list", "[]")
-        val array = JSONArray(jsonStr)
-        val list = mutableListOf<Account>()
-        for (i in 0 until array.length()) {
-            val obj = array.getJSONObject(i)
-            list.add(Account(obj.getString("name"), obj.getString("apiKey")))
-        }
-        return list
-    }
-
-    fun getActiveApiKey(): String? {
-        val activeName = prefs.getString("active_account", null) ?: return getAllAccounts().firstOrNull()?.apiKey
-        return getAllAccounts().find { it.name == activeName }?.apiKey
-    }
-
-    fun getActiveName(): String {
-        return prefs.getString("active_account", null) ?: getAllAccounts().firstOrNull()?.name ?: "Default User"
-    }
-
-    fun saveAccount(name: String, apiKey: String) {
-        val accounts = getAllAccounts().toMutableList()
-        val existingIndex = accounts.indexOfFirst { it.name == name }
-        if (existingIndex >= 0) {
-            accounts[existingIndex] = Account(name, apiKey)
-        } else {
-            accounts.add(Account(name, apiKey))
-        }
-        saveAccountsList(accounts)
-        setActiveAccount(name)
-    }
-
-    fun setActiveAccount(name: String) {
-        prefs.edit().putString("active_account", name).apply()
-    }
-
-    private fun saveAccountsList(accounts: List<Account>) {
-        val array = JSONArray()
-        for (acc in accounts) {
-            val obj = JSONObject()
-            obj.put("name", acc.name)
-            obj.put("apiKey", acc.apiKey)
-            array.put(obj)
-        }
-        prefs.edit().putString("accounts_list", array.toString()).apply()
-    }
-}
-
-object GeminiApiClient {
-    fun validateApiKey(apiKey: String): Boolean {
-        return try {
-            val url = URL("https://generativelanguage.googleapis.com/v1beta/models?key=$apiKey")
-            val conn = url.openConnection() as HttpURLConnection
-            conn.requestMethod = "GET"
-            conn.connectTimeout = 5000
-            conn.readTimeout = 5000
-            conn.responseCode == 200
-        } catch (e: Exception) {
-            false
-        }
-    }
-
-    fun getActiveModels(apiKey: String): List<String> {
-        val models = mutableListOf<String>()
-        try {
-            val url = URL("https://generativelanguage.googleapis.com/v1beta/models?key=$apiKey")
-            val conn = url.openConnection() as HttpURLConnection
-            conn.requestMethod = "GET"
-            if (conn.responseCode == 200) {
-                val reader = BufferedReader(InputStreamReader(conn.inputStream))
-                val sb = StringBuilder()
-                var line: String?
-                while (reader.readLine().also { line = it } != null) {
-                    sb.append(line)
-                }
-                reader.close()
-                val jsonResponse = JSONObject(sb.toString())
-                val modelsArray = jsonResponse.getJSONArray("models")
-                for (i in 0 until modelsArray.length()) {
-                    val obj = modelsArray.getJSONObject(i)
-                    val name = obj.getString("name").replace("models/", "")
-                    val methods = obj.optJSONArray("supportedGenerationMethods")
-                    var supportsGenerateContent = false
-                    if (methods != null) {
-                        for (j in 0 until methods.length()) {
-                            if (methods.getString(j) == "generateContent") {
-                                supportsGenerateContent = true
-                                break
-                            }
-                        }
-                    }
-                    if (supportsGenerateContent) {
-                        models.add(name)
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            models.add("gemini-1.5-flash")
-        }
-        return if (models.isEmpty()) listOf("gemini-1.5-flash") else models
-    }
-
-    fun sendMessage(apiKey: String, model: String, history: List<ChatMessage>): String {
-        return try {
-            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey")
-            val conn = url.openConnection() as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.doOutput = true
-
-            val jsonBody = JSONObject()
-            val contents = JSONArray()
-
-            for (msg in history) {
-                val roleStr = if (msg.isUser) "user" else "model"
-                val codeTexts = msg.codeFiles.joinToString("\n") { "```${it.language}\n// filename: ${it.fileName}\n${it.content}\n```" }
-                val fullText = msg.message + if (codeTexts.isNotEmpty()) "\n$codeTexts" else ""
-
-                val parts = JSONArray()
-                if (!msg.attachmentBase64.isNullOrEmpty() && !msg.attachmentMimeType.isNullOrEmpty()) {
-                    val inlineData = JSONObject()
-                        .put("mime_type", msg.attachmentMimeType)
-                        .put("data", msg.attachmentBase64)
-                    parts.put(JSONObject().put("inline_data", inlineData))
-                }
-
-                parts.put(JSONObject().put("text", fullText))
-                contents.put(JSONObject().put("role", roleStr).put("parts", parts))
-            }
-
-            jsonBody.put("contents", contents)
-
-            val toolsArray = JSONArray().put(JSONObject().put("googleSearch", JSONObject()))
-            jsonBody.put("tools", toolsArray)
-
-            val writer = OutputStreamWriter(conn.outputStream)
-            writer.write(jsonBody.toString())
-            writer.flush()
-            writer.close()
-
-            if (conn.responseCode == 200) {
-                val reader = BufferedReader(InputStreamReader(conn.inputStream))
-                val sb = StringBuilder()
-                var line: String?
-                while (reader.readLine().also { line = it } != null) {
-                    sb.append(line)
-                }
-                reader.close()
-                val jsonResponse = JSONObject(sb.toString())
-                val candidates = jsonResponse.getJSONArray("candidates")
-                candidates.getJSONObject(0)
-                    .getJSONObject("content")
-                    .getJSONArray("parts")
-                    .getJSONObject(0)
-                    .getString("text")
-            } else {
-                val errorStream = conn.errorStream
-                val errorMsg = if (errorStream != null) BufferedReader(InputStreamReader(errorStream)).readText() else ""
-                "Error: Kode Respon ${conn.responseCode} - $errorMsg"
-            }
-        } catch (e: Exception) {
-            "Error: ${e.localizedMessage}"
-        }
-    }
-}
-
-class ChatAdapter(
-    private val messages: List<ChatMessage>,
-    private var playingMessage: ChatMessage?,
-    private val onTtsClicked: (ChatMessage) -> Unit
-) : RecyclerView.Adapter<ChatAdapter.ChatViewHolder>() {
-
-    fun updatePlayingState(msg: ChatMessage?) {
-        playingMessage = msg
-        notifyDataSetChanged()
-    }
-
-    class ChatViewHolder(view: View) : RecyclerView.ViewHolder(view) {
-        val tvMessage: TextView = view.findViewById(R.id.tvMessage)
-        val tvCodeInfo: TextView = view.findViewById(R.id.tvCodeInfo)
-        val btnPlayTts: ImageButton = view.findViewById(R.id.btnPlayTts)
-    }
-
-    override fun getItemViewType(position: Int): Int {
-        return if (messages[position].isUser) 1 else 2
-    }
-
-    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ChatViewHolder {
-        val layoutRes = if (viewType == 1) R.layout.item_chat_user else R.layout.item_chat_ai
-        val view = LayoutInflater.from(parent.context).inflate(layoutRes, parent, false)
-        return ChatViewHolder(view)
-    }
-
-    override fun onBindViewHolder(holder: ChatViewHolder, position: Int) {
-        val msg = messages[position]
-        holder.tvMessage.text = msg.message
-
-        if (msg.codeFiles.isNotEmpty()) {
-            holder.tvCodeInfo.visibility = View.VISIBLE
-            val fileNames = msg.codeFiles.joinToString(", ") { it.fileName }
-            holder.tvCodeInfo.text = "Lampiran Kode: $fileNames"
-        } else {
-            holder.tvCodeInfo.visibility = View.GONE
-        }
-
-        if (!msg.isUser) {
-            holder.btnPlayTts.visibility = View.VISIBLE
-            val isPlaying = (playingMessage == msg)
-            holder.btnPlayTts.setImageResource(if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play)
-            holder.btnPlayTts.setOnClickListener {
-                onTtsClicked(msg)
-            }
-        } else {
-            holder.btnPlayTts.visibility = View.GONE
-        }
-    }
-
-    override fun getItemCount() = messages.size
-}
 
 class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private val RECORD_AUDIO_PERMISSION_CODE = 101
@@ -288,7 +39,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private val messages = mutableListOf<ChatMessage>()
     private var selectedModel = "gemini-1.5-flash"
     private var tts: TextToSpeech? = null
-    private var mediaPlayer: MediaPlayer? = null
     private var speechRecognizer: SpeechRecognizer? = null
     private var playingMessage: ChatMessage? = null
     private var isFromVoiceInput = false
@@ -372,75 +122,21 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         checkAuthAndInit()
     }
 
-    private fun stopAllTts() {
-        try {
-            if (tts?.isSpeaking == true) {
-                tts?.stop()
-            }
-        } catch (e: Exception) {}
-
-        try {
-            mediaPlayer?.let {
-                if (it.isPlaying) {
-                    it.stop()
-                }
-                it.release()
-            }
-            mediaPlayer = null
-        } catch (e: Exception) {}
-
-        playingMessage = null
-        chatAdapter.updatePlayingState(null)
-    }
-
     private fun toggleTts(msg: ChatMessage) {
-        if (playingMessage == msg && (tts?.isSpeaking == true || mediaPlayer?.isPlaying == true)) {
-            stopAllTts()
+        if (playingMessage == msg && tts?.isSpeaking == true) {
+            tts?.stop()
+            playingMessage = null
+            chatAdapter.updatePlayingState(null)
         } else {
-            stopAllTts()
+            tts?.stop()
             playingMessage = msg
             chatAdapter.updatePlayingState(msg)
 
-            val textToSpeak = msg.message
-            val prefs = getSharedPreferences("nujuma_prefs", MODE_PRIVATE)
-            val ttsMode = prefs.getString("tts_mode", "builtin") ?: "builtin"
-
-            if (ttsMode == "builtin") {
-                val params = Bundle()
-                params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "nujuma_tts")
-                tts?.speak(textToSpeak, TextToSpeech.QUEUE_FLUSH, params, "nujuma_tts")
-            } else {
-                val gender = if (ttsMode == "serverless_cowok") "cowok" else "cewek"
-                val encodedText = URLEncoder.encode(textToSpeak, "UTF-8")
-                val urlString = "https://tts-phi-sand.vercel.app/tts?text=$encodedText&gender=$gender"
-
-                thread {
-                    try {
-                        val mp = MediaPlayer().apply {
-                            setDataSource(urlString)
-                            prepare()
-                            start()
-                            setOnCompletionListener {
-                                runOnUiThread {
-                                    if (playingMessage == msg) {
-                                        playingMessage = null
-                                        chatAdapter.updatePlayingState(null)
-                                    }
-                                    release()
-                                    mediaPlayer = null
-                                }
-                            }
-                        }
-                        mediaPlayer = mp
-                    } catch (e: Exception) {
-                        runOnUiThread {
-                            Toast.makeText(this, "Gagal memutar TTS Serverless: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
-                            playingMessage = null
-                            chatAdapter.updatePlayingState(null)
-                        }
-                    }
-                }
-            }
+            val codeTexts = msg.codeFiles.joinToString("\n") { "${it.fileName}:\n${it.content}" }
+            val textToSpeak = msg.message + if (codeTexts.isNotEmpty()) "\n$codeTexts" else ""
+            val params = Bundle()
+            params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "nujuma_tts")
+            tts?.speak(textToSpeak, TextToSpeech.QUEUE_FLUSH, params, "nujuma_tts")
         }
     }
 
@@ -461,10 +157,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 filesArray.put(fObj)
             }
             obj.put("codeFiles", filesArray)
-            if (msg.attachmentBase64 != null) {
-                obj.put("attachmentBase64", msg.attachmentBase64)
-                obj.put("attachmentMimeType", msg.attachmentMimeType)
-            }
             array.put(obj)
         }
         val sessionId = "Sesi ${System.currentTimeMillis()}"
@@ -502,16 +194,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         )
                     }
                 }
-                val attBase64 = if (obj.has("attachmentBase64")) obj.getString("attachmentBase64") else null
-                val attMime = if (obj.has("attachmentMimeType")) obj.getString("attachmentMimeType") else null
-
                 messages.add(
                     ChatMessage(
                         message = obj.getString("message"),
                         isUser = obj.getBoolean("isUser"),
-                        codeFiles = codeFiles,
-                        attachmentBase64 = attBase64,
-                        attachmentMimeType = attMime
+                        codeFiles = codeFiles
                     )
                 )
             }
@@ -601,25 +288,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun showTtsSettingsDialog() {
-        val prefs = getSharedPreferences("nujuma_prefs", MODE_PRIVATE)
-        val currentMode = prefs.getString("tts_mode", "builtin") ?: "builtin"
-
-        val options = arrayOf("TTS Bawaan HP", "TTS Serverless (Cewek)", "TTS Serverless (Cowok)")
-        val modeKeys = arrayOf("builtin", "serverless_cewek", "serverless_cowok")
-        val currentIndex = modeKeys.indexOf(currentMode).coerceAtLeast(0)
-
-        val builder = AlertDialog.Builder(this)
-        builder.setTitle("Pengaturan Suara (TTS)")
-        builder.setSingleChoiceItems(options, currentIndex) { dialog, which ->
-            val chosenMode = modeKeys[which]
-            prefs.edit().putString("tts_mode", chosenMode).apply()
-            Toast.makeText(this, "TTS disetel ke: ${options[which]}", Toast.LENGTH_SHORT).show()
-            dialog.dismiss()
-        }
-        builder.show()
-    }
-
     private fun showPopupMenu(view: View) {
         val popup = PopupMenu(this, view)
         popup.menu.add("Obrolan Baru")
@@ -642,7 +310,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     showAccountManagerDialog()
                 }
                 "Pengaturan Suara (TTS)" -> {
-                    showTtsSettingsDialog()
+                    val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                    startActivity(intent)
                 }
             }
             true
@@ -686,6 +355,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         chatAdapter.notifyItemInserted(messages.size - 1)
         rvChat.scrollToPosition(messages.size - 1)
         etInput.setText("")
+        
         currentAttachmentBase64 = null
         currentAttachmentMimeType = null
 
@@ -702,24 +372,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
             for (match in matches) {
                 val lang = match.groupValues[1].ifEmpty { "txt" }
-                val fullContent = match.groupValues[2].trim()
-                val lines = fullContent.lines().toMutableList()
-                var fileName: String? = null
+                val codeContent = match.groupValues[2].trim()
 
-                val checkLimit = minOf(3, lines.size)
-                for (i in 0 until checkLimit) {
-                    val line = lines[i].trim()
-                    val fileNameRegex = Regex("^(?:--|//|#|/\\*)\\s*filename:\\s*([\\w.-]+)", RegexOption.IGNORE_CASE)
-                    val nameMatch = fileNameRegex.find(line)
-                    if (nameMatch != null) {
-                        fileName = nameMatch.groupValues[1]
-                        lines.removeAt(i)
-                        break
-                    }
-                }
-                val cleanedContent = lines.joinToString("\n").trim()
-                val finalFileName = fileName ?: "file_${System.currentTimeMillis()}.$lang"
-                fileList.add(CodeFile(fileName = finalFileName, content = cleanedContent, language = lang))
+                val firstLine = codeContent.lines().firstOrNull() ?: ""
+                val fileNameRegex = Regex("(?:--|//|#|/\\*)\\s*filename:\\s*([\\w.-]+)", RegexOption.IGNORE_CASE)
+                val nameMatch = fileNameRegex.find(firstLine)
+
+                val fileName = nameMatch?.groupValues?.get(1) ?: "file_${System.currentTimeMillis()}.$lang"
+                fileList.add(CodeFile(fileName = fileName, content = codeContent, language = lang))
             }
 
             val cleanMessage = rawResponse.replace(codeBlockRegex, "").trim()
@@ -763,7 +423,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         btnMic.setOnTouchListener { _, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
-                    stopAllTts()
                     checkPermissionAndStartVoice()
                     true
                 }
@@ -843,7 +502,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     override fun onDestroy() {
         saveCurrentSession()
-        stopAllTts()
+        tts?.stop()
         tts?.shutdown()
         speechRecognizer?.destroy()
         super.onDestroy()

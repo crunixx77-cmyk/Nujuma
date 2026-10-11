@@ -1,9 +1,11 @@
+// filename: MainActivity.kt
 package com.nujuma.app
 
 import android.Manifest
 import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
@@ -29,6 +31,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URLEncoder
 import java.util.Locale
 import kotlin.concurrent.thread
 
@@ -39,9 +42,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private val messages = mutableListOf<ChatMessage>()
     private var selectedModel = "gemini-1.5-flash"
     private var tts: TextToSpeech? = null
+    private var mediaPlayer: MediaPlayer? = null
     private var speechRecognizer: SpeechRecognizer? = null
     private var playingMessage: ChatMessage? = null
     private var isFromVoiceInput = false
+
+    private var pendingMediaBase64: String? = null
+    private var pendingMediaMimeType: String? = null
 
     private lateinit var tvProfileName: TextView
     private lateinit var tvModelName: TextView
@@ -49,31 +56,24 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private lateinit var etInput: EditText
     private lateinit var btnMic: ImageButton
 
-    private var currentAttachmentBase64: String? = null
-    private var currentAttachmentMimeType: String? = null
-
     private val filePickerLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri?.let {
             try {
                 val mimeType = contentResolver.getType(it) ?: "*/*"
-                if (mimeType.startsWith("image/") || mimeType.startsWith("audio/")) {
-                    contentResolver.openInputStream(it)?.use { inputStream ->
-                        val bytes = inputStream.readBytes()
-                        currentAttachmentBase64 = Base64.encodeToString(bytes, Base64.DEFAULT)
-                        currentAttachmentMimeType = mimeType
-                        val typeName = if (mimeType.startsWith("image/")) "Gambar" else "Audio"
-                        val currentText = etInput.text.toString()
-                        val newText = if (currentText.isEmpty()) "[$typeName terlampir]" else "$currentText\n[$typeName terlampir]"
-                        etInput.setText(newText)
-                        Toast.makeText(this, "$typeName berhasil dilampirkan!", Toast.LENGTH_SHORT).show()
-                    }
-                } else {
+                if (mimeType.startsWith("text/") || mimeType == "application/json" || mimeType == "application/xml") {
                     contentResolver.openInputStream(it)?.use { inputStream ->
                         val contentText = inputStream.bufferedReader().readText()
                         val currentText = etInput.text.toString()
                         val newText = if (currentText.isEmpty()) contentText else "$currentText\n$contentText"
                         etInput.setText(newText)
                         Toast.makeText(this, "File teks berhasil dilampirkan!", Toast.LENGTH_SHORT).show()
+                    }
+                } else {
+                    contentResolver.openInputStream(it)?.use { inputStream ->
+                        val bytes = inputStream.readBytes()
+                        pendingMediaBase64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                        pendingMediaMimeType = mimeType
+                        Toast.makeText(this, "File media ($mimeType) berhasil dilampirkan!", Toast.LENGTH_SHORT).show()
                     }
                 }
             } catch (e: Exception) {
@@ -122,21 +122,78 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         checkAuthAndInit()
     }
 
-    private fun toggleTts(msg: ChatMessage) {
-        if (playingMessage == msg && tts?.isSpeaking == true) {
-            tts?.stop()
+    private fun stopAllAudio() {
+        try {
+            if (tts?.isSpeaking == true) {
+                tts?.stop()
+            }
+            mediaPlayer?.let {
+                if (it.isPlaying) {
+                    it.stop()
+                }
+                it.release()
+            }
+            mediaPlayer = null
             playingMessage = null
             chatAdapter.updatePlayingState(null)
-        } else {
-            tts?.stop()
-            playingMessage = msg
-            chatAdapter.updatePlayingState(msg)
+        } catch (e: Exception) {
+            // Abaikan error saat penghentian audio
+        }
+    }
 
-            val codeTexts = msg.codeFiles.joinToString("\n") { "${it.fileName}:\n${it.content}" }
-            val textToSpeak = msg.message + if (codeTexts.isNotEmpty()) "\n$codeTexts" else ""
+    private fun toggleTts(msg: ChatMessage) {
+        if (playingMessage == msg && (tts?.isSpeaking == true || mediaPlayer?.isPlaying == true)) {
+            stopAllAudio()
+            return
+        }
+
+        stopAllAudio()
+        playingMessage = msg
+        chatAdapter.updatePlayingState(msg)
+
+        val prefs = getSharedPreferences("nujuma_tts_prefs", MODE_PRIVATE)
+        val ttsMode = prefs.getString("tts_mode", "builtin") ?: "builtin"
+
+        // Hanya membacakan teks murni (msg.message), blok kode tidak disertakan ke TTS
+        val textToSpeak = msg.message
+        if (textToSpeak.isBlank()) {
+            stopAllAudio()
+            return
+        }
+
+        if (ttsMode == "builtin") {
             val params = Bundle()
             params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "nujuma_tts")
             tts?.speak(textToSpeak, TextToSpeech.QUEUE_FLUSH, params, "nujuma_tts")
+        } else {
+            val gender = if (ttsMode == "serverless_cowok") "cowok" else "cewek"
+            thread {
+                try {
+                    val encodedText = URLEncoder.encode(textToSpeak, "UTF-8")
+                    val streamUrl = "https://tts-phi-sand.vercel.app/tts?text=$encodedText&gender=$gender"
+                    runOnUiThread {
+                        try {
+                            mediaPlayer = MediaPlayer().apply {
+                                setDataSource(streamUrl)
+                                prepareAsync()
+                                setOnPreparedListener { mp -> mp.start() }
+                                setOnCompletionListener {
+                                    stopAllAudio()
+                                }
+                                setOnErrorListener { _, _, _ ->
+                                    stopAllAudio()
+                                    Toast.makeText(this@MainActivity, "Gagal memutar audio serverless", Toast.LENGTH_SHORT).show()
+                                    true
+                                }
+                            }
+                        } catch (e: Exception) {
+                            stopAllAudio()
+                        }
+                    }
+                } catch (e: Exception) {
+                    runOnUiThread { stopAllAudio() }
+                }
+            }
         }
     }
 
@@ -288,6 +345,24 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    private fun showTtsSettingsDialog() {
+        val prefs = getSharedPreferences("nujuma_tts_prefs", MODE_PRIVATE)
+        val currentMode = prefs.getString("tts_mode", "builtin") ?: "builtin"
+
+        val options = arrayOf("TTS Bawaan HP", "TTS Serverless Vercel (Cewek)", "TTS Serverless Vercel (Cowok)")
+        val modeValues = arrayOf("builtin", "serverless_cewek", "serverless_cowok")
+        val currentIndex = modeValues.indexOf(currentMode).coerceAtLeast(0)
+
+        val builder = AlertDialog.Builder(this)
+        builder.setTitle("Pengaturan Suara (TTS)")
+        builder.setSingleChoiceItems(options, currentIndex) { dialog, which ->
+            prefs.edit().putString("tts_mode", modeValues[which]).apply()
+            Toast.makeText(this, "Pengaturan TTS disimpan: ${options[which]}", Toast.LENGTH_SHORT).show()
+            dialog.dismiss()
+        }
+        builder.show()
+    }
+
     private fun showPopupMenu(view: View) {
         val popup = PopupMenu(this, view)
         popup.menu.add("Obrolan Baru")
@@ -310,8 +385,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     showAccountManagerDialog()
                 }
                 "Pengaturan Suara (TTS)" -> {
-                    val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                    startActivity(intent)
+                    showTtsSettingsDialog()
                 }
             }
             true
@@ -341,30 +415,33 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun handleSendMessage(isVoice: Boolean = false) {
         val text = etInput.text.toString().trim()
         val apiKey = accountManager.getActiveApiKey()
-        if ((text.isEmpty() && currentAttachmentBase64 == null) || apiKey == null) return
+        if ((text.isEmpty() && pendingMediaBase64 == null) || apiKey == null) return
 
         isFromVoiceInput = isVoice
 
-        val userMessage = ChatMessage(
-            message = text,
-            isUser = true,
-            attachmentBase64 = currentAttachmentBase64,
-            attachmentMimeType = currentAttachmentMimeType
-        )
+        val userMessage = ChatMessage(text.ifEmpty { "[File Media Dilampirkan]" }, isUser = true)
         messages.add(userMessage)
         chatAdapter.notifyItemInserted(messages.size - 1)
         rvChat.scrollToPosition(messages.size - 1)
         etInput.setText("")
-        
-        currentAttachmentBase64 = null
-        currentAttachmentMimeType = null
+
+        val currentMediaBase64 = pendingMediaBase64
+        val currentMediaMimeType = pendingMediaMimeType
+        pendingMediaBase64 = null
+        pendingMediaMimeType = null
 
         showThinkingIndicator()
 
         val historyToSend = messages.filter { it.message != "Nujuma sedang berpikir..." }
 
         thread {
-            val rawResponse = GeminiApiClient.sendMessage(apiKey, selectedModel, historyToSend)
+            val rawResponse = GeminiApiClient.sendMessage(
+                apiKey = apiKey,
+                model = selectedModel,
+                history = historyToSend,
+                mediaBase64 = currentMediaBase64,
+                mediaMimeType = currentMediaMimeType
+            )
 
             val codeBlockRegex = Regex("```(\\w+)?\\n([\\s\\S]*?)```")
             val matches = codeBlockRegex.findAll(rawResponse)
@@ -374,12 +451,29 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 val lang = match.groupValues[1].ifEmpty { "txt" }
                 val codeContent = match.groupValues[2].trim()
 
-                val firstLine = codeContent.lines().firstOrNull() ?: ""
+                // Periksa hingga 3 baris pertama untuk mendeteksi penanda nama file
+                val lines = codeContent.lines().toMutableList()
+                var fileName: String? = null
+                var foundIndex = -1
                 val fileNameRegex = Regex("(?:--|//|#|/\\*)\\s*filename:\\s*([\\w.-]+)", RegexOption.IGNORE_CASE)
-                val nameMatch = fileNameRegex.find(firstLine)
 
-                val fileName = nameMatch?.groupValues?.get(1) ?: "file_${System.currentTimeMillis()}.$lang"
-                fileList.add(CodeFile(fileName = fileName, content = codeContent, language = lang))
+                for (i in 0 until minOf(3, lines.size)) {
+                    val nameMatch = fileNameRegex.find(lines[i])
+                    if (nameMatch != null) {
+                        fileName = nameMatch.groupValues[1]
+                        foundIndex = i
+                        break
+                    }
+                }
+
+                // Bersihkan baris penanda dari konten kode jika ditemukan
+                if (foundIndex != -1) {
+                    lines.removeAt(foundIndex)
+                }
+
+                val cleanedContent = lines.joinToString("\n").trim()
+                val finalFileName = fileName ?: "file_${System.currentTimeMillis()}.$lang"
+                fileList.add(CodeFile(fileName = finalFileName, content = cleanedContent, language = lang))
             }
 
             val cleanMessage = rawResponse.replace(codeBlockRegex, "").trim()
@@ -423,6 +517,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         btnMic.setOnTouchListener { _, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
+                    // Hentikan suara TTS seketika saat tombol mic ditekan
+                    stopAllAudio()
                     checkPermissionAndStartVoice()
                     true
                 }
@@ -502,7 +598,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     override fun onDestroy() {
         saveCurrentSession()
-        tts?.stop()
+        stopAllAudio()
         tts?.shutdown()
         speechRecognizer?.destroy()
         super.onDestroy()
